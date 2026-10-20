@@ -33,6 +33,7 @@ import it.fast4x.rimusic.utils.playNext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -40,6 +41,7 @@ import me.knighthat.utils.Toaster
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 @OptIn(ExperimentalAtomicApi::class)
@@ -58,6 +60,14 @@ class ExoPlayerListener(
     private var volumeNormalizationJob: Job = Job()
     private var errorTimestamp = 0L
     private var lastErrorMessage = ""
+
+    /**
+     * Number of errors in a row without any item reaching [Player.STATE_READY].
+     * Caps [Preferences.PLAYBACK_SKIP_ON_ERROR] so a queue where every item
+     * fails (e.g. broken stream extraction, or repeat-all) doesn't spin forever.
+     */
+    private var consecutiveErrors = 0
+    private var skipOnErrorJob: Job? = null
 
     var loudnessEnhancer: LoudnessEnhancer? = null
         private set
@@ -179,6 +189,8 @@ class ExoPlayerListener(
     }
 
     override fun onMediaItemTransition( mediaItem: MediaItem?, reason: Int ) {
+        // A pending skip-on-error is obsolete once the item changed
+        skipOnErrorJob?.cancel()
         if ( player.playerError != null ) player.prepare()
 
         loadFromRadio(reason)
@@ -214,8 +226,27 @@ class ExoPlayerListener(
 
         // TODO: Add additional recovery step if type of error allows it
 
-        if ( Preferences.PLAYBACK_SKIP_ON_ERROR.value && player.hasNextMediaItem() )
-            player.playNext()
+        consecutiveErrors++
+        if ( !Preferences.PLAYBACK_SKIP_ON_ERROR.value || !player.hasNextMediaItem() )
+            return
+        if ( consecutiveErrors > MAX_CONSECUTIVE_SKIPS ) {
+            // Leave the player in its error state, user can retry manually
+            consecutiveErrors = 0
+            return
+        }
+
+        // 0.5s, 1s, 2s, 4s... between skips instead of immediately
+        val backoff = SKIP_BACKOFF_BASE * (1 shl (consecutiveErrors - 1))
+        skipOnErrorJob?.cancel()
+        skipOnErrorJob = CoroutineScope( Dispatchers.Main ).launch {
+            delay( backoff )
+            if ( player.playerError != null && player.hasNextMediaItem() )
+                player.playNext()
+        }
+    }
+
+    override fun onPlaybackStateChanged( playbackState: Int ) {
+        if ( playbackState == Player.STATE_READY ) consecutiveErrors = 0
     }
 
     override fun onEvents(player: Player, events: Player.Events) {
@@ -236,5 +267,10 @@ class ExoPlayerListener(
                 }
             }
         }
+    }
+
+    private companion object {
+        const val MAX_CONSECUTIVE_SKIPS = 5
+        val SKIP_BACKOFF_BASE = 500.milliseconds
     }
 }
